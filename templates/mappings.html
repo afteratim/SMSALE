@@ -1,1 +1,55 @@
-{% extends "base.html" %}{% block content %}<h1>Product Mapping</h1><p class="muted">Edit cells directly and save each row. No mapping file upload is needed.</p><section class="card"><h2>Add mapping</h2><form method="post" class="inline"><input type="hidden" name="action" value="save"><input name="sales_name" placeholder="Sales product" required><input name="mapped_name" list="stocks" placeholder="Mapped stock product" required><datalist id="stocks">{% for s in stocks %}<option value="{{s}}">{% endfor %}</datalist><button>Save</button></form></section><section class="card"><form class="inline"><input name="q" value="{{q}}" placeholder="Search"><button>Search</button></form><div class="scroll"><table><tr><th>Sales Product</th><th>Mapped Product</th><th>Action</th></tr>{% for r in rows %}<tr data-id="{{r.id}}"><td contenteditable="true" class="s">{{r.sales_name}}</td><td contenteditable="true" class="m">{{r.mapped_name}}</td><td><button onclick="saveRow(this)" type="button">Save</button> <button class="danger" onclick="delRow(this)" type="button">Delete</button></td></tr>{% endfor %}</table></div></section><script>async function saveRow(b){let t=b.closest('tr'),r=await fetch('/api/mappings/'+t.dataset.id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({sales_name:t.querySelector('.s').innerText.trim(),mapped_name:t.querySelector('.m').innerText.trim()})});alert(r.ok?'Saved':'Save failed')}async function delRow(b){let t=b.closest('tr');if(confirm('Delete mapping?')){let r=await fetch('/api/mappings/'+t.dataset.id,{method:'DELETE'});if(r.ok)t.remove()}}</script>{% endblock %}
+{% extends "base.html" %}{% block content %}
+<h1>Product Mapping</h1>
+<p class="muted">Paste two columns directly from Excel or paste a Markdown table. Column 1 = Sales Product; Column 2 = Mapped Product.</p>
+
+<section class="card">
+  <h2>Paste multiple mappings</h2>
+  <form method="post">
+    <input type="hidden" name="action" value="bulk_paste">
+    <label for="bulk_mappings">Paste your mapping table here</label>
+    <textarea id="bulk_mappings" name="bulk_mappings" rows="8" placeholder="| Sales Product | Mapped Product |&#10;| --- | --- |&#10;| 12X12 NAPKIN 100 CC 25 PTD | 12X12 AL FRESH 100 PTD CC 25 |&#10;| TABLE TOP 125 CC 80 | TABLE TOP 125 PLAIN CC60 |" style="width:100%;padding:12px;border:1px solid #cfd4dc;border-radius:8px;font:13px monospace"></textarea>
+    <p class="muted">The website detects Markdown pipe tables and tab-separated data copied from Excel. Separator rows are ignored. Existing mappings for the same Sales Product are updated.</p>
+    <button type="submit">Detect &amp; Save Mappings</button>
+  </form>
+</section>
+
+<section class="card">
+  <h2>Add one mapping</h2>
+  <form method="post" class="inline">
+    <input type="hidden" name="action" value="save">
+    <input name="sales_name" placeholder="Sales product" required>
+    <input name="mapped_name" list="stocks" placeholder="Mapped stock product" required>
+    <datalist id="stocks">{% for s in stocks %}<option value="{{s}}">{% endfor %}</datalist>
+    <button>Save</button>
+  </form>
+</section>
+
+<section class="card">
+  <h2>Saved mappings</h2>
+  <form class="inline"><input name="q" value="{{q}}" placeholder="Search mappings"><button>Search</button></form>
+  <div class="scroll"><table>
+    <tr><th>Sales Product</th><th>Mapped Product</th><th>Action</th></tr>
+    {% for r in rows %}
+    <tr data-id="{{r.id}}">
+      <td contenteditable="true" class="s">{{r.sales_name}}</td>
+      <td contenteditable="true" class="m">{{r.mapped_name}}</td>
+      <td><button onclick="saveRow(this)" type="button">Save</button> <button class="danger" onclick="delRow(this)" type="button">Delete</button></td>
+    </tr>
+    {% else %}<tr><td colspan="3">No mappings found.</td></tr>{% endfor %}
+  </table></div>
+</section>
+<script>
+async function saveRow(b){
+  let t=b.closest('tr');
+  let r=await fetch('/api/mappings/'+t.dataset.id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({sales_name:t.querySelector('.s').innerText.trim(),mapped_name:t.querySelector('.m').innerText.trim()})});
+  alert(r.ok?'Saved':'Save failed');
+}
+async function delRow(b){
+  let t=b.closest('tr');
+  if(confirm('Delete mapping?')){
+    let r=await fetch('/api/mappings/'+t.dataset.id,{method:'DELETE'});
+    if(r.ok)t.remove();
+  }
+}
+</script>
+{% endblock %}
