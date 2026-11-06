@@ -12,19 +12,70 @@ from openpyxl import load_workbook, Workbook
 app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY", "change-this-secret-before-deploy-" + secrets.token_hex(8))
 app.config["MAX_CONTENT_LENGTH"] = 30 * 1024 * 1024
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///sales_rate_app.db")
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
+# Storage selection:
+# - If DATABASE_URL is configured, use that database (e.g. PostgreSQL on Render).
+# - If DATABASE_URL is absent, use a local SQLite database file.
+# SQLite is itself file-based, so the app works without configuring an external DB.
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATABASE_URL = (os.getenv("DATABASE_URL") or "").strip()
+
+if DATABASE_URL:
+    if DATABASE_URL.startswith("postgres://"):
+        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+    if DATABASE_URL.startswith("sqlite:///") and not DATABASE_URL.startswith("sqlite:////"):
+        # Keep explicitly configured relative SQLite paths inside the app directory.
+        sqlite_path = DATABASE_URL[len("sqlite:///"):]
+        if sqlite_path and sqlite_path != ":memory:":
+            DATABASE_URL = "sqlite:///" + os.path.join(BASE_DIR, sqlite_path)
+else:
+    sqlite_path = os.getenv("SQLITE_PATH", os.path.join(BASE_DIR, "sales_rate_app.db"))
+    DATABASE_URL = "sqlite:///" + os.path.abspath(sqlite_path)
+
+engine_options = {"pool_pre_ping": True, "future": True}
+if DATABASE_URL.startswith("sqlite:"):
+    engine_options["connect_args"] = {"check_same_thread": False, "timeout": 30}
+    if DATABASE_URL.endswith(":memory:"):
+        engine_options["poolclass"] = __import__("sqlalchemy").pool.StaticPool
+
+engine = create_engine(DATABASE_URL, **engine_options)
 
 def db(sql, params=None, fetch=False, many=False):
+    """
+    Execute a statement without leaking an active SQLAlchemy Result/cursor
+    beyond its connection/transaction. This is important for SQLite commits.
+    """
     with engine.begin() as c:
         result = c.execute(text(sql), params or {})
         if fetch:
-            return [dict(x._mapping) for x in result.fetchall()]
-        if many:
-            return result.rowcount
-        return result
+            rows = [dict(x._mapping) for x in result.fetchall()]
+            result.close()
+            return rows
+        rowcount = result.rowcount
+        # Drain/close any result set before the transaction is committed.
+        if result.returns_rows:
+            result.fetchall()
+        result.close()
+        return rowcount if many or not fetch else None
+
+def insert_sales_report(filename, created_at, report_json):
+    """Insert a report and return its ID without leaving RETURNING active."""
+    with engine.begin() as c:
+        if engine.dialect.name == "postgresql":
+            result = c.execute(
+                text("INSERT INTO sales_reports(filename,created_at,report_json) "
+                     "VALUES(:f,:d,:j) RETURNING id"),
+                {"f": filename, "d": created_at, "j": report_json}
+            )
+            report_id = result.scalar_one()
+            result.close()
+            return report_id
+
+        c.execute(
+            text("INSERT INTO sales_reports(filename,created_at,report_json) "
+                 "VALUES(:f,:d,:j)"),
+            {"f": filename, "d": created_at, "j": report_json}
+        )
+        return c.execute(text("SELECT last_insert_rowid()")).scalar_one()
 
 def init_db():
     idtype = "SERIAL PRIMARY KEY" if engine.dialect.name == "postgresql" else "INTEGER PRIMARY KEY AUTOINCREMENT"
@@ -417,9 +468,11 @@ def sales():
                     "Rate Source": selected_source or "Missing Rate"
                 })
             report={"rows":out,"suggestions":suggestions}
-            cur=db("INSERT INTO sales_reports(filename,created_at,report_json) VALUES(:f,:d,:j) RETURNING id",
-                   {"f":f.filename,"d":datetime.utcnow().isoformat(timespec="seconds"),"j":json.dumps(report,ensure_ascii=False)})
-            report_id=cur.scalar()
+            report_id = insert_sales_report(
+                f.filename,
+                datetime.utcnow().isoformat(timespec="seconds"),
+                json.dumps(report, ensure_ascii=False)
+            )
             session["last_report"]=report_id
             return redirect(url_for("report",report_id=report_id))
         except Exception as e: flash(str(e),"error")
