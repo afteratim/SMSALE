@@ -1,0 +1,316 @@
+import os, re, io, csv, json, secrets
+from datetime import datetime, date
+from difflib import SequenceMatcher
+from functools import wraps
+from flask import Flask, render_template, request, redirect, url_for, session, flash, send_file, jsonify
+from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.utils import secure_filename
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import SQLAlchemyError
+import pandas as pd
+
+app = Flask(__name__)
+app.secret_key = os.getenv("SECRET_KEY", "change-this-secret-before-deploy-" + secrets.token_hex(8))
+app.config["MAX_CONTENT_LENGTH"] = 30 * 1024 * 1024
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///sales_rate_app.db")
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
+
+def db(sql, params=None, fetch=False, many=False):
+    with engine.begin() as c:
+        result = c.execute(text(sql), params or {})
+        if fetch:
+            return [dict(x._mapping) for x in result.fetchall()]
+        if many:
+            return result.rowcount
+        return result
+
+def init_db():
+    idtype = "SERIAL PRIMARY KEY" if engine.dialect.name == "postgresql" else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    stmts = [
+    f"""CREATE TABLE IF NOT EXISTS users (id {idtype}, username VARCHAR(100) UNIQUE NOT NULL, password_hash TEXT NOT NULL)""",
+    f"""CREATE TABLE IF NOT EXISTS stock_master (id {idtype}, name TEXT UNIQUE NOT NULL)""",
+    f"""CREATE TABLE IF NOT EXISTS mappings (id {idtype}, sales_name TEXT UNIQUE NOT NULL, mapped_name TEXT NOT NULL, confirmed INTEGER DEFAULT 1, updated_at TEXT NOT NULL)""",
+    f"""CREATE TABLE IF NOT EXISTS sm_rates (id {idtype}, product TEXT NOT NULL, rate FLOAT NOT NULL, txn_date TEXT, row_order INTEGER NOT NULL)""",
+    f"""CREATE TABLE IF NOT EXISTS danish_rates (id {idtype}, product TEXT NOT NULL, rate FLOAT NOT NULL, txn_date TEXT, row_order INTEGER NOT NULL)""",
+    f"""CREATE TABLE IF NOT EXISTS upload_history (id {idtype}, kind TEXT NOT NULL, filename TEXT, uploaded_at TEXT NOT NULL, row_count INTEGER DEFAULT 0, note TEXT)""",
+    f"""CREATE TABLE IF NOT EXISTS sales_reports (id {idtype}, filename TEXT, created_at TEXT NOT NULL, report_json TEXT NOT NULL)"""
+    ]
+    with engine.begin() as c:
+        for s in stmts: c.execute(text(s))
+        count = c.execute(text("SELECT COUNT(*) FROM stock_master")).scalar()
+        if not count:
+            try:
+                with open(os.path.join(os.path.dirname(__file__), "stock_master_seed.csv"), encoding="utf-8-sig") as f:
+                    for row in csv.DictReader(f):
+                        if row.get("name"):
+                            c.execute(text("INSERT INTO stock_master(name) VALUES(:n)"), {"n":row["name"]})
+            except FileNotFoundError: pass
+        users = c.execute(text("SELECT COUNT(*) FROM users")).scalar()
+        if not users:
+            username=os.getenv("ADMIN_USERNAME","admin")
+            password=os.getenv("ADMIN_PASSWORD","ChangeMe123!")
+            c.execute(text("INSERT INTO users(username,password_hash) VALUES(:u,:p)"),
+                      {"u":username,"p":generate_password_hash(password)})
+
+def login_required(fn):
+    @wraps(fn)
+    def wrap(*a, **kw):
+        if not session.get("user"): return redirect(url_for("login"))
+        return fn(*a, **kw)
+    return wrap
+
+def norm(s):
+    return re.sub(r"[^A-Z0-9]+","",str(s or "").upper())
+
+def parse_qty(v):
+    if v is None or pd.isna(v): return None
+    m=re.search(r"-?\\d+(?:\\.\\d+)?",str(v).replace(",",""))
+    return float(m.group()) if m else None
+
+def parse_date(v):
+    if v is None or pd.isna(v) or str(v).strip()=="": return None
+    try: return pd.to_datetime(v, dayfirst=True, errors="coerce").date().isoformat()
+    except Exception: return None
+
+def read_excel(file):
+    if not file or not file.filename.lower().endswith((".xlsx",".xlsm")):
+        raise ValueError("Please upload an .xlsx or .xlsm Excel file.")
+    return pd.read_excel(file, dtype=object)
+
+def require_cols(df, cols, label):
+    missing=[x for x in cols if x not in df.columns]
+    if missing: raise ValueError(f"{label}: missing columns: {', '.join(missing)}")
+
+def extract_rates(df, product_col, kind):
+    require_cols(df, ["Date","Column1","Vch Type",product_col], kind)
+    out=[]
+    current_date=None
+    for i, row in df.iterrows():
+        row_date=parse_date(row.get("Date"))
+        if row_date: current_date=row_date
+        qty=parse_qty(row.get("Column1"))
+        amount=pd.to_numeric(row.get("Vch Type"), errors="coerce")
+        product=row.get(product_col)
+        if product is None or pd.isna(product) or not str(product).strip() or qty in (None,0) or pd.isna(amount):
+            continue
+        d=current_date
+        if not d: continue
+        out.append({"product":str(product).strip(),"rate":float(amount)/qty,"txn_date":d,"row_order":int(i)})
+    # Most recent date; ties resolved by last occurrence in source order
+    latest={}
+    for x in out:
+        k=norm(x["product"])
+        if k not in latest or (x["txn_date"],x["row_order"]) >= (latest[k]["txn_date"],latest[k]["row_order"]):
+            latest[k]=x
+    return list(latest.values()), len(out)
+
+def log_upload(kind, filename, count, note=""):
+    db("INSERT INTO upload_history(kind,filename,uploaded_at,row_count,note) VALUES(:k,:f,:d,:r,:n)",
+       {"k":kind,"f":filename,"d":datetime.utcnow().isoformat(timespec="seconds"),"r":count,"n":note})
+
+def replace_rates(table, rows):
+    # Validation happens before this transaction; old master remains if parsing fails.
+    with engine.begin() as c:
+        c.execute(text(f"DELETE FROM {table}"))
+        for r in rows:
+            c.execute(text(f"INSERT INTO {table}(product,rate,txn_date,row_order) VALUES(:p,:r,:d,:o)"),
+                      {"p":r["product"],"r":r["rate"],"d":r["txn_date"],"o":r["row_order"]})
+
+def sales_extract(df):
+    require_cols(df, ["Particulars","Column1","Vch Type","Vch No."], "Sales Register")
+    df=df.copy()
+    current=None
+    result=[]
+    excluded={"LOCAL SALE","CGST","SGST","ROUNDED OFF"}
+    for i,row in df.iterrows():
+        vno=row.get("Vch No.")
+        if vno is not None and not pd.isna(vno) and str(vno).strip():
+            party=row.get("Particulars")
+            v=str(vno)
+            current=f"{v[3:7]} - {party}" if party is not None and not pd.isna(party) else v[3:7]
+        vtype=row.get("Vch Type")
+        if str(vtype).strip().lower()=="sales": continue
+        item=row.get("Particulars")
+        if item is None or pd.isna(item) or str(item).strip().upper() in excluded: continue
+        q=row.get("Column1")
+        if q is None or pd.isna(q): continue
+        qty=parse_qty(q)
+        if qty is None: continue
+        result.append({"Particulars":str(item).strip(),"Custom 1":current or "",
+                       "Pairs":int(qty) if float(qty).is_integer() else qty})
+    return result
+
+def mappings_dict():
+    return {norm(x["sales_name"]):x["mapped_name"] for x in db("SELECT sales_name,mapped_name FROM mappings",fetch=True)}
+
+def rate_dict(table):
+    return {norm(x["product"]):x["rate"] for x in db(f"SELECT product,rate FROM {table}",fetch=True)}
+
+@app.route("/login", methods=["GET","POST"])
+def login():
+    if request.method=="POST":
+        rows=db("SELECT * FROM users WHERE username=:u",{"u":request.form.get("username","")},True)
+        if rows and check_password_hash(rows[0]["password_hash"],request.form.get("password","")):
+            session["user"]=rows[0]["username"]; return redirect(url_for("index"))
+        flash("Invalid username or password.","error")
+    return render_template("login.html")
+
+@app.route("/logout")
+def logout():
+    session.clear(); return redirect(url_for("login"))
+
+@app.route("/")
+@login_required
+def index():
+    counts={t:db(f"SELECT COUNT(*) n FROM {t}",fetch=True)[0]["n"] for t in ["mappings","sm_rates","danish_rates","sales_reports"]}
+    history=db("SELECT * FROM upload_history ORDER BY id DESC LIMIT 8",fetch=True)
+    return render_template("index.html",counts=counts,history=history)
+
+@app.route("/rates",methods=["GET","POST"])
+@login_required
+def rates():
+    if request.method=="POST":
+        kind=request.form.get("kind")
+        try:
+            f=request.files.get("file"); df=read_excel(f)
+            if kind=="sm":
+                rows,total=extract_rates(df,"Particulars1","SM Sale")
+                table="sm_rates"; label="SM Sale"
+            elif kind=="danish":
+                rows,total=extract_rates(df,"Particulars","Danish Purchase")
+                table="danish_rates"; label="Danish Purchase"
+            else: raise ValueError("Unknown rate type.")
+            if not rows: raise ValueError("No valid dated product-rate rows found. Existing rates were not changed.")
+            replace_rates(table,rows); log_upload(label,f.filename,len(rows),f"{total} valid rows; latest dated rate retained per product.")
+            flash(f"{label} rates replaced successfully: {len(rows)} products saved.","success")
+        except Exception as e: flash(str(e),"error")
+        return redirect(url_for("rates"))
+    sm=db("SELECT product,rate,txn_date FROM sm_rates ORDER BY product",fetch=True)
+    dan=db("SELECT product,rate,txn_date FROM danish_rates ORDER BY product",fetch=True)
+    return render_template("rates.html",sm=sm,dan=dan)
+
+@app.route("/mappings",methods=["GET","POST"])
+@login_required
+def mappings():
+    if request.method=="POST":
+        action=request.form.get("action")
+        try:
+            if action=="save":
+                sales=(request.form.get("sales_name") or "").strip()
+                mapped=(request.form.get("mapped_name") or "").strip()
+                if not sales or not mapped: raise ValueError("Both product names are required.")
+                db("""INSERT INTO mappings(sales_name,mapped_name,confirmed,updated_at)
+                    VALUES(:s,:m,1,:d) ON CONFLICT(sales_name) DO UPDATE SET mapped_name=:m,confirmed=1,updated_at=:d""",
+                   {"s":sales,"m":mapped,"d":datetime.utcnow().isoformat(timespec="seconds")})
+                flash("Mapping saved.","success")
+            elif action=="delete":
+                db("DELETE FROM mappings WHERE id=:id",{"id":int(request.form["id"])})
+                flash("Mapping deleted.","success")
+            elif action=="add_stock":
+                name=request.form.get("name","").strip()
+                if name: db("INSERT INTO stock_master(name) VALUES(:n) ON CONFLICT(name) DO NOTHING",{"n":name})
+            elif action=="bulk_auto":
+                candidates=db("SELECT name FROM stock_master",fetch=True)
+                existing=mappings_dict(); sales_names=db("SELECT DISTINCT product FROM sales_products_view",fetch=True) if False else []
+                flash("Auto suggestions are generated when a Sales Register is processed.","success")
+        except Exception as e: flash(str(e),"error")
+        return redirect(url_for("mappings"))
+    q=request.args.get("q","").strip()
+    rows=db("SELECT * FROM mappings WHERE sales_name LIKE :q OR mapped_name LIKE :q ORDER BY sales_name LIMIT 1000",{"q":f"%{q}%"},True)
+    stocks=db("SELECT name FROM stock_master ORDER BY name LIMIT 2000",fetch=True)
+    return render_template("mappings.html",rows=rows,stocks=[x["name"] for x in stocks],q=q)
+
+@app.route("/sales",methods=["GET","POST"])
+@login_required
+def sales():
+    if request.method=="POST":
+        try:
+            f=request.files.get("file"); df=read_excel(f)
+            items=sales_extract(df)
+            if not items: raise ValueError("No sales product rows found.")
+            maps=mappings_dict()
+            stock=db("SELECT name FROM stock_master",fetch=True)
+            stock_by_norm={norm(x["name"]):x["name"] for x in stock}
+            sm=rate_dict("sm_rates"); dan=rate_dict("danish_rates")
+            out=[]; suggestions=[]
+            for x in items:
+                source=x["Particulars"]; key=norm(source)
+                mapped=maps.get(key)
+                exact=stock_by_norm.get(key)
+                if not mapped and exact: mapped=exact
+                if not mapped:
+                    # Auto-map only unambiguous strong matches; otherwise suggest for review.
+                    ranked=sorted(((SequenceMatcher(None,key,norm(s)).ratio(),s) for s in stock_by_norm.values()),reverse=True)
+                    if ranked and ranked[0][0]>=0.96 and (len(ranked)==1 or ranked[0][0]-ranked[1][0]>=0.03):
+                        mapped=ranked[0][1]
+                        db("""INSERT INTO mappings(sales_name,mapped_name,confirmed,updated_at)
+                            VALUES(:s,:m,1,:d) ON CONFLICT(sales_name) DO UPDATE SET mapped_name=:m,updated_at=:d""",
+                           {"s":source,"m":mapped,"d":datetime.utcnow().isoformat(timespec="seconds")})
+                    elif ranked and ranked[0][0]>=0.72:
+                        suggestions.append({"sales":source,"suggested":ranked[0][1],"score":round(ranked[0][0]*100)})
+                final=mapped or "NA"
+                out.append({**x,"60%":final,"Final":final,
+                            "SM Rate":sm.get(norm(final)),"Danish Pur Rate":dan.get(norm(final)),
+                            "Mapping Status":"Mapped" if mapped else "Needs Mapping",
+                            "Rate Status":"Missing Rate" if sm.get(norm(final)) is None and dan.get(norm(final)) is None else "OK"})
+            report={"rows":out,"suggestions":suggestions}
+            cur=db("INSERT INTO sales_reports(filename,created_at,report_json) VALUES(:f,:d,:j) RETURNING id",
+                   {"f":f.filename,"d":datetime.utcnow().isoformat(timespec="seconds"),"j":json.dumps(report,ensure_ascii=False)})
+            report_id=cur.scalar()
+            session["last_report"]=report_id
+            return redirect(url_for("report",report_id=report_id))
+        except Exception as e: flash(str(e),"error")
+        return redirect(url_for("sales"))
+    return render_template("sales.html")
+
+@app.route("/report/<int:report_id>")
+@login_required
+def report(report_id):
+    rows=db("SELECT * FROM sales_reports WHERE id=:id",{"id":report_id},True)
+    if not rows: return "Report not found",404
+    data=json.loads(rows[0]["report_json"])
+    return render_template("report.html",report=rows[0],rows=data["rows"],suggestions=data["suggestions"])
+
+@app.route("/report/<int:report_id>/download")
+@login_required
+def download_report(report_id):
+    rows=db("SELECT * FROM sales_reports WHERE id=:id",{"id":report_id},True)
+    if not rows: return "Report not found",404
+    data=json.loads(rows[0]["report_json"])
+    df=pd.DataFrame(data["rows"])
+    buf=io.BytesIO()
+    with pd.ExcelWriter(buf,engine="openpyxl") as writer:
+        df.to_excel(writer,index=False,sheet_name="Sales Result")
+        pd.DataFrame(data["suggestions"]).to_excel(writer,index=False,sheet_name="Mapping Suggestions")
+    buf.seek(0)
+    return send_file(buf,as_attachment=True,download_name="Sales_Reconciliation.xlsx",
+                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+@app.route("/history")
+@login_required
+def history():
+    rows=db("SELECT id,filename,created_at FROM sales_reports ORDER BY id DESC",fetch=True)
+    return render_template("history.html",rows=rows)
+
+@app.route("/api/mappings/<int:mid>",methods=["PUT","DELETE"])
+@login_required
+def mapping_api(mid):
+    if request.method=="DELETE":
+        db("DELETE FROM mappings WHERE id=:id",{"id":mid}); return jsonify(ok=True)
+    data=request.get_json(force=True)
+    s=(data.get("sales_name") or "").strip(); m=(data.get("mapped_name") or "").strip()
+    if not s or not m: return jsonify(error="Both names required"),400
+    db("UPDATE mappings SET sales_name=:s,mapped_name=:m,updated_at=:d WHERE id=:id",
+       {"s":s,"m":m,"d":datetime.utcnow().isoformat(timespec="seconds"),"id":mid})
+    return jsonify(ok=True)
+
+@app.errorhandler(413)
+def too_large(e): return "File exceeds 30 MB upload limit.",413
+
+with app.app_context():
+    init_db()
+
+if __name__=="__main__":
+    app.run(host="0.0.0.0",port=int(os.getenv("PORT",5000)),debug=False)

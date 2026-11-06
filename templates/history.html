@@ -1,0 +1,1 @@
+{% extends "base.html" %}{% block content %}<h1>Sales History</h1><section class="card"><table><tr><th>File</th><th>Created</th><th>Report</th></tr>{% for r in rows %}<tr><td>{{r.filename}}</td><td>{{r.created_at[:10]}}</td><td><a href="/report/{{r.id}}">Open</a></td></tr>{% else %}<tr><td colspan="3">No saved reports.</td></tr>{% endfor %}</table></section>{% endblock %}
