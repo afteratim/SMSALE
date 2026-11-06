@@ -174,37 +174,86 @@ def select_latest_rates(rows):
 def sales_extract(raw):
     if not raw:
         raise ValueError("Sales Register is empty.")
-    headers = [str(x).strip() if x is not None else "" for x in raw[0]]
-    required = ["Particulars", "Column1", "Vch Type", "Vch No."]
-    missing = [name for name in required if name not in headers]
-    if missing:
-        raise ValueError("Sales Register: missing columns: " + ", ".join(missing))
+    required = ["Date", "Particulars", "Vch Type", "Vch No."]
+    header_index = None
+    headers = []
+    for i, candidate in enumerate(raw[:40]):
+        candidate_headers = [str(x).strip() if x is not None else "" for x in candidate]
+        if all(name in candidate_headers for name in required):
+            header_index = i
+            headers = candidate_headers
+            break
+    if header_index is None:
+        raise ValueError("Sales Register: could not locate the column-heading row (Date, Particulars, Vch Type, Vch No.).")
+
     positions = {name: headers.index(name) for name in required}
+    # In the uploaded Busy/Tally export, quantity is in Excel column C.
+    # The heading cell is blank in some exports, so do not depend on its label.
+    qty_pos = 2
     current=None
     result=[]
     excluded={"LOCAL SALE", "CGST", "SGST", "ROUNDED OFF"}
-    for row in raw[1:]:
+    for row in raw[header_index+1:]:
         row=tuple(row)
         def cell(name):
             pos=positions[name]
             return row[pos] if pos < len(row) else None
+
         vno=cell("Vch No.")
         if not is_empty(vno):
             party=cell("Particulars")
-            v=str(vno)
-            current=f"{v[3:7]} - {party}" if not is_empty(party) else v[3:7]
+            v=str(vno).strip()
+            parts=v.split("/")
+            voucher_ref=parts[1] if len(parts)>1 and parts[1] else v[3:7]
+            current=f"{voucher_ref} - {party}" if not is_empty(party) else voucher_ref
+
         vtype=cell("Vch Type")
         if str(vtype).strip().lower()=="sales":
             continue
         item=cell("Particulars")
         if is_empty(item) or str(item).strip().upper() in excluded:
             continue
-        qty=parse_qty(cell("Column1"))
+        qty_value=row[qty_pos] if qty_pos < len(row) else None
+        qty=parse_qty(qty_value)
         if qty is None:
             continue
-        result.append({"Particulars":str(item).strip(), "Custom 1":current or "",
-                       "Pairs":int(qty) if float(qty).is_integer() else qty})
+        result.append({
+            "Particulars":str(item).strip(),
+            "Custom 1":current or "",
+            "Pairs":int(qty) if float(qty).is_integer() else qty
+        })
     return result
+
+def parse_pasted_mappings(pasted):
+    """
+    Accepts Markdown pipe tables or Excel/Sheets tab-separated two-column rows.
+    Column 1 = Sales Register product; Column 2 = mapped stock product.
+    Markdown separator rows and optional header rows are skipped.
+    """
+    parsed=[]
+    for raw_line in (pasted or "").splitlines():
+        line=raw_line.strip()
+        if not line:
+            continue
+        if "|" in line:
+            cells=[x.strip() for x in line.strip("|").split("|")]
+        elif "\t" in line:
+            cells=[x.strip() for x in line.split("\t")]
+        else:
+            continue
+        if len(cells)<2:
+            continue
+        left,right=cells[0],cells[1]
+        # Ignore Markdown separator lines such as | --- | --- |
+        if re.fullmatch(r"[:\-\s]+",left or "") and re.fullmatch(r"[:\-\s]+",right or ""):
+            continue
+        # Ignore common optional column headings.
+        if norm(left) in {"SALESNAME","SALESPRODUCT","PARTICULARS","SOURCEPRODUCT","FROM"} and \
+           norm(right) in {"MAPPEDPRODUCT","STOCKNAME","TONAME","MAPPEDNAME","TO"}:
+            continue
+        if left and right:
+            parsed.append((left,right))
+    return parsed
 
 def log_upload(kind, filename, count, note=""):
     db("INSERT INTO upload_history(kind,filename,uploaded_at,row_count,note) VALUES(:k,:f,:d,:r,:n)",
@@ -284,6 +333,19 @@ def mappings():
                     VALUES(:s,:m,1,:d) ON CONFLICT(sales_name) DO UPDATE SET mapped_name=:m,confirmed=1,updated_at=:d""",
                    {"s":sales,"m":mapped,"d":datetime.utcnow().isoformat(timespec="seconds")})
                 flash("Mapping saved.","success")
+            elif action=="bulk_paste":
+                pasted=request.form.get("bulk_mappings","")
+                pairs=parse_pasted_mappings(pasted)
+                if not pairs:
+                    raise ValueError("No mapping pairs detected. Paste a two-column Markdown table or tab-separated Excel data.")
+                saved=0
+                for sales_name,mapped_name in pairs:
+                    db("""INSERT INTO mappings(sales_name,mapped_name,confirmed,updated_at)
+                        VALUES(:s,:m,1,:d)
+                        ON CONFLICT(sales_name) DO UPDATE SET mapped_name=:m,confirmed=1,updated_at=:d""",
+                       {"s":sales_name,"m":mapped_name,"d":datetime.utcnow().isoformat(timespec="seconds")})
+                    saved+=1
+                flash(f"{saved} mapping rows detected and saved. Existing source-name mappings were updated.","success")
             elif action=="delete":
                 db("DELETE FROM mappings WHERE id=:id",{"id":int(request.form["id"])})
                 flash("Mapping deleted.","success")
