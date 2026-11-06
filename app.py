@@ -7,7 +7,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
-import pandas as pd
+from openpyxl import load_workbook, Workbook
 
 app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY", "change-this-secret-before-deploy-" + secrets.token_hex(8))
@@ -64,30 +64,45 @@ def login_required(fn):
 def norm(s):
     return re.sub(r"[^A-Z0-9]+","",str(s or "").upper())
 
-def parse_qty(v):
-    if v is None or pd.isna(v): return None
-    m=re.search(r"-?\d+(?:\.\d+)?",str(v).replace(",",""))
-    return float(m.group()) if m else None
+def is_empty(value):
+    return value is None or (isinstance(value, str) and not value.strip())
 
-def parse_date(v):
-    if v is None or pd.isna(v) or str(v).strip()=="": return None
-    try: return pd.to_datetime(v, dayfirst=True, errors="coerce").date().isoformat()
-    except Exception: return None
+def parse_qty(value):
+    if is_empty(value):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    match = re.search(r"-?\d+(?:\.\d+)?", str(value).replace(",", ""))
+    return float(match.group()) if match else None
 
-def read_excel(file):
-    if not file or not file.filename.lower().endswith((".xlsx",".xlsm")):
+def parse_date(value):
+    if is_empty(value):
+        return None
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    value = str(value).strip()
+    for fmt in ("%d-%b-%y", "%d-%b-%Y", "%d/%m/%Y", "%d/%m/%y",
+                "%Y-%m-%d", "%d-%m-%Y", "%d-%m-%y"):
+        try:
+            return datetime.strptime(value, fmt).date().isoformat()
+        except ValueError:
+            pass
+    return None
+
+def open_workbook_rows(file):
+    if not file or not file.filename.lower().endswith((".xlsx", ".xlsm")):
         raise ValueError("Please upload an .xlsx or .xlsm Excel file.")
-    return pd.read_excel(file, dtype=object)
-
-def read_raw_excel(file):
-    if not file or not file.filename.lower().endswith((".xlsx",".xlsm")):
-        raise ValueError("Please upload an .xlsx or .xlsm Excel file.")
-    # These ledgers have title rows before their column headings. Read raw cells,
-    # not the first row as a dataframe header.
-    return pd.read_excel(file, header=None, dtype=object)
+    file.stream.seek(0)
+    wb = load_workbook(file.stream, read_only=True, data_only=True)
+    ws = wb[wb.sheetnames[0]]
+    rows = list(ws.iter_rows(values_only=True))
+    wb.close()
+    return rows
 
 def numeric_value(value):
-    if value is None or pd.isna(value):
+    if is_empty(value):
         return None
     if isinstance(value, (int, float)):
         return float(value)
@@ -101,79 +116,48 @@ def numeric_value(value):
 
 def extract_danish_rates(raw):
     """
-    Danish Purchase Register layout:
-    A=Date (voucher header), B=Particulars, C=Qty, D=printed rate,
-    E=Amount. Rows before the column header and voucher/ledger rows are ignored.
+    Danish Purchase: A=date, B=product, C=qty, D=printed rate (ignored),
+    E=amount. Voucher date is filled down to subsequent product rows.
     """
     out=[]
     current_date=None
-    for i, row in raw.iterrows():
-        date_value = row.iloc[0] if len(row) > 0 else None
-        parsed_date = parse_date(date_value)
+    for i, row in enumerate(raw):
+        row = tuple(row)
+        parsed_date = parse_date(row[0] if len(row)>0 else None)
         if parsed_date:
             current_date = parsed_date
-
-        product = row.iloc[1] if len(row) > 1 else None
-        qty_value = row.iloc[2] if len(row) > 2 else None
-        amount_value = row.iloc[4] if len(row) > 4 else None
-
-        if product is None or pd.isna(product):
+        product = row[1] if len(row)>1 else None
+        qty = numeric_value(row[2] if len(row)>2 else None)
+        amount = numeric_value(row[4] if len(row)>4 else None)
+        if is_empty(product) or qty in (None, 0) or amount is None or current_date is None:
             continue
         product = str(product).strip()
-        if not product:
-            continue
-        # A valid detail line has a numeric quantity and amount. This excludes
-        # supplier names, Local Purchase, SMART R/OFF, Rounded Off and totals.
-        qty = numeric_value(qty_value)
-        amount = numeric_value(amount_value)
-        if qty is None or qty == 0 or amount is None or current_date is None:
-            continue
         if product.upper() in {"LOCAL PURCHASE", "SMART R/OFF", "ROUNDED OFF", "ROUNDED OFF (P)"}:
             continue
-        out.append({
-            "product": product,
-            "rate": amount / qty,
-            "txn_date": current_date,
-            "row_order": int(i)
-        })
+        out.append({"product":product, "rate":amount/qty, "txn_date":current_date, "row_order":i})
     return select_latest_rates(out), len(out)
 
 def extract_sm_rates(raw):
     """
-    SM Sale ledger layout:
-    A=Date (voucher header), C=Particulars/item, D=Qty, E=printed rate,
-    F=Amount. Product lines inherit the latest date in column A.
-    Blank/invalid amounts are ignored so they cannot replace an older valid rate.
+    SM Sale: A=date, C=product, D=qty, E=printed rate (ignored),
+    F=amount. Blank/invalid amount rows are skipped.
     """
     out=[]
     current_date=None
-    for i, row in raw.iterrows():
-        date_value = row.iloc[0] if len(row) > 0 else None
-        parsed_date = parse_date(date_value)
+    for i, row in enumerate(raw):
+        row = tuple(row)
+        parsed_date = parse_date(row[0] if len(row)>0 else None)
         if parsed_date:
             current_date = parsed_date
-
-        product = row.iloc[2] if len(row) > 2 else None
-        qty_value = row.iloc[3] if len(row) > 3 else None
-        amount_value = row.iloc[5] if len(row) > 5 else None
-
-        if product is None or pd.isna(product):
+        product = row[2] if len(row)>2 else None
+        qty = numeric_value(row[3] if len(row)>3 else None)
+        amount = numeric_value(row[5] if len(row)>5 else None)
+        if is_empty(product) or qty in (None, 0) or amount is None or current_date is None:
             continue
         product = str(product).strip()
-        if not product:
-            continue
-        qty = numeric_value(qty_value)
-        amount = numeric_value(amount_value)
-        if qty is None or qty == 0 or amount is None or current_date is None:
-            continue
         if product.upper() in {"LOCAL SALES", "SMART R/OFF", "ROUNDED OFF", "(AS PER DETAILS)", "OPENING BALANCE", "CLOSING BALANCE"}:
             continue
-        out.append({
-            "product": product,
-            "rate": amount / qty,
-            "txn_date": current_date,
-            "row_order": int(i)
-        })
+        out.append({"product":product, "rate":amount/qty, "txn_date":current_date, "row_order":i})
     return select_latest_rates(out), len(out)
 
 def select_latest_rates(rows):
@@ -187,9 +171,40 @@ def select_latest_rates(rows):
             latest[key]=item
     return list(latest.values())
 
-def require_cols(df, cols, label):
-    missing=[x for x in cols if x not in df.columns]
-    if missing: raise ValueError(f"{label}: missing columns: {', '.join(missing)}")
+def sales_extract(raw):
+    if not raw:
+        raise ValueError("Sales Register is empty.")
+    headers = [str(x).strip() if x is not None else "" for x in raw[0]]
+    required = ["Particulars", "Column1", "Vch Type", "Vch No."]
+    missing = [name for name in required if name not in headers]
+    if missing:
+        raise ValueError("Sales Register: missing columns: " + ", ".join(missing))
+    positions = {name: headers.index(name) for name in required}
+    current=None
+    result=[]
+    excluded={"LOCAL SALE", "CGST", "SGST", "ROUNDED OFF"}
+    for row in raw[1:]:
+        row=tuple(row)
+        def cell(name):
+            pos=positions[name]
+            return row[pos] if pos < len(row) else None
+        vno=cell("Vch No.")
+        if not is_empty(vno):
+            party=cell("Particulars")
+            v=str(vno)
+            current=f"{v[3:7]} - {party}" if not is_empty(party) else v[3:7]
+        vtype=cell("Vch Type")
+        if str(vtype).strip().lower()=="sales":
+            continue
+        item=cell("Particulars")
+        if is_empty(item) or str(item).strip().upper() in excluded:
+            continue
+        qty=parse_qty(cell("Column1"))
+        if qty is None:
+            continue
+        result.append({"Particulars":str(item).strip(), "Custom 1":current or "",
+                       "Pairs":int(qty) if float(qty).is_integer() else qty})
+    return result
 
 def log_upload(kind, filename, count, note=""):
     db("INSERT INTO upload_history(kind,filename,uploaded_at,row_count,note) VALUES(:k,:f,:d,:r,:n)",
@@ -202,30 +217,6 @@ def replace_rates(table, rows):
         for r in rows:
             c.execute(text(f"INSERT INTO {table}(product,rate,txn_date,row_order) VALUES(:p,:r,:d,:o)"),
                       {"p":r["product"],"r":r["rate"],"d":r["txn_date"],"o":r["row_order"]})
-
-def sales_extract(df):
-    require_cols(df, ["Particulars","Column1","Vch Type","Vch No."], "Sales Register")
-    df=df.copy()
-    current=None
-    result=[]
-    excluded={"LOCAL SALE","CGST","SGST","ROUNDED OFF"}
-    for i,row in df.iterrows():
-        vno=row.get("Vch No.")
-        if vno is not None and not pd.isna(vno) and str(vno).strip():
-            party=row.get("Particulars")
-            v=str(vno)
-            current=f"{v[3:7]} - {party}" if party is not None and not pd.isna(party) else v[3:7]
-        vtype=row.get("Vch Type")
-        if str(vtype).strip().lower()=="sales": continue
-        item=row.get("Particulars")
-        if item is None or pd.isna(item) or str(item).strip().upper() in excluded: continue
-        q=row.get("Column1")
-        if q is None or pd.isna(q): continue
-        qty=parse_qty(q)
-        if qty is None: continue
-        result.append({"Particulars":str(item).strip(),"Custom 1":current or "",
-                       "Pairs":int(qty) if float(qty).is_integer() else qty})
-    return result
 
 def mappings_dict():
     return {norm(x["sales_name"]):x["mapped_name"] for x in db("SELECT sales_name,mapped_name FROM mappings",fetch=True)}
@@ -260,7 +251,7 @@ def rates():
         kind=request.form.get("kind")
         try:
             f=request.files.get("file")
-            raw=read_raw_excel(f)
+            raw=open_workbook_rows(f)
             if kind=="sm":
                 rows,total=extract_sm_rates(raw)
                 table="sm_rates"; label="SM Sale"
@@ -315,8 +306,8 @@ def mappings():
 def sales():
     if request.method=="POST":
         try:
-            f=request.files.get("file"); df=read_excel(f)
-            items=sales_extract(df)
+            f=request.files.get("file"); raw=open_workbook_rows(f)
+            items=sales_extract(raw)
             if not items: raise ValueError("No sales product rows found.")
             maps=mappings_dict()
             stock=db("SELECT name FROM stock_master",fetch=True)
@@ -388,11 +379,18 @@ def download_report(report_id):
     if not rows: return "Report not found",404
     data=json.loads(rows[0]["report_json"])
     export_columns=["Particulars","Narration","Sale Name","Pairs","Final Name","SM rate or danish pur rate"]
-    df=pd.DataFrame(data["rows"]).reindex(columns=export_columns)
     buf=io.BytesIO()
-    with pd.ExcelWriter(buf,engine="openpyxl") as writer:
-        df.to_excel(writer,index=False,sheet_name="Sales Result")
-        pd.DataFrame(data["suggestions"]).to_excel(writer,index=False,sheet_name="Mapping Suggestions")
+    wb=Workbook()
+    ws=wb.active
+    ws.title="Sales Result"
+    ws.append(export_columns)
+    for item in data["rows"]:
+        ws.append([item.get(column) for column in export_columns])
+    suggest_ws=wb.create_sheet("Mapping Suggestions")
+    suggest_ws.append(["Sales product","Suggested stock product","Similarity"])
+    for item in data["suggestions"]:
+        suggest_ws.append([item.get("sales"),item.get("suggested"),item.get("score")])
+    wb.save(buf)
     buf.seek(0)
     return send_file(buf,as_attachment=True,download_name="Sales_Reconciliation.xlsx",
                      mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
