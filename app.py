@@ -66,7 +66,7 @@ def norm(s):
 
 def parse_qty(v):
     if v is None or pd.isna(v): return None
-    m=re.search(r"-?\\d+(?:\\.\\d+)?",str(v).replace(",",""))
+    m=re.search(r"-?\d+(?:\.\d+)?",str(v).replace(",",""))
     return float(m.group()) if m else None
 
 def parse_date(v):
@@ -79,32 +79,117 @@ def read_excel(file):
         raise ValueError("Please upload an .xlsx or .xlsm Excel file.")
     return pd.read_excel(file, dtype=object)
 
+def read_raw_excel(file):
+    if not file or not file.filename.lower().endswith((".xlsx",".xlsm")):
+        raise ValueError("Please upload an .xlsx or .xlsm Excel file.")
+    # These ledgers have title rows before their column headings. Read raw cells,
+    # not the first row as a dataframe header.
+    return pd.read_excel(file, header=None, dtype=object)
+
+def numeric_value(value):
+    if value is None or pd.isna(value):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = str(value).strip().replace(",", "").replace("Dr", "").replace("Cr", "").strip()
+    if not s:
+        return None
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        return None
+
+def extract_danish_rates(raw):
+    """
+    Danish Purchase Register layout:
+    A=Date (voucher header), B=Particulars, C=Qty, D=printed rate,
+    E=Amount. Rows before the column header and voucher/ledger rows are ignored.
+    """
+    out=[]
+    current_date=None
+    for i, row in raw.iterrows():
+        date_value = row.iloc[0] if len(row) > 0 else None
+        parsed_date = parse_date(date_value)
+        if parsed_date:
+            current_date = parsed_date
+
+        product = row.iloc[1] if len(row) > 1 else None
+        qty_value = row.iloc[2] if len(row) > 2 else None
+        amount_value = row.iloc[4] if len(row) > 4 else None
+
+        if product is None or pd.isna(product):
+            continue
+        product = str(product).strip()
+        if not product:
+            continue
+        # A valid detail line has a numeric quantity and amount. This excludes
+        # supplier names, Local Purchase, SMART R/OFF, Rounded Off and totals.
+        qty = numeric_value(qty_value)
+        amount = numeric_value(amount_value)
+        if qty is None or qty == 0 or amount is None or current_date is None:
+            continue
+        if product.upper() in {"LOCAL PURCHASE", "SMART R/OFF", "ROUNDED OFF", "ROUNDED OFF (P)"}:
+            continue
+        out.append({
+            "product": product,
+            "rate": amount / qty,
+            "txn_date": current_date,
+            "row_order": int(i)
+        })
+    return select_latest_rates(out), len(out)
+
+def extract_sm_rates(raw):
+    """
+    SM Sale ledger layout:
+    A=Date (voucher header), C=Particulars/item, D=Qty, E=printed rate,
+    F=Amount. Product lines inherit the latest date in column A.
+    Blank/invalid amounts are ignored so they cannot replace an older valid rate.
+    """
+    out=[]
+    current_date=None
+    for i, row in raw.iterrows():
+        date_value = row.iloc[0] if len(row) > 0 else None
+        parsed_date = parse_date(date_value)
+        if parsed_date:
+            current_date = parsed_date
+
+        product = row.iloc[2] if len(row) > 2 else None
+        qty_value = row.iloc[3] if len(row) > 3 else None
+        amount_value = row.iloc[5] if len(row) > 5 else None
+
+        if product is None or pd.isna(product):
+            continue
+        product = str(product).strip()
+        if not product:
+            continue
+        qty = numeric_value(qty_value)
+        amount = numeric_value(amount_value)
+        if qty is None or qty == 0 or amount is None or current_date is None:
+            continue
+        if product.upper() in {"LOCAL SALES", "SMART R/OFF", "ROUNDED OFF", "(AS PER DETAILS)", "OPENING BALANCE", "CLOSING BALANCE"}:
+            continue
+        out.append({
+            "product": product,
+            "rate": amount / qty,
+            "txn_date": current_date,
+            "row_order": int(i)
+        })
+    return select_latest_rates(out), len(out)
+
+def select_latest_rates(rows):
+    latest={}
+    for item in rows:
+        key=norm(item["product"])
+        if not key:
+            continue
+        old=latest.get(key)
+        if old is None or (item["txn_date"], item["row_order"]) >= (old["txn_date"], old["row_order"]):
+            latest[key]=item
+    return list(latest.values())
+
 def require_cols(df, cols, label):
     missing=[x for x in cols if x not in df.columns]
     if missing: raise ValueError(f"{label}: missing columns: {', '.join(missing)}")
-
-def extract_rates(df, product_col, kind):
-    require_cols(df, ["Date","Column1","Vch Type",product_col], kind)
-    out=[]
-    current_date=None
-    for i, row in df.iterrows():
-        row_date=parse_date(row.get("Date"))
-        if row_date: current_date=row_date
-        qty=parse_qty(row.get("Column1"))
-        amount=pd.to_numeric(row.get("Vch Type"), errors="coerce")
-        product=row.get(product_col)
-        if product is None or pd.isna(product) or not str(product).strip() or qty in (None,0) or pd.isna(amount):
-            continue
-        d=current_date
-        if not d: continue
-        out.append({"product":str(product).strip(),"rate":float(amount)/qty,"txn_date":d,"row_order":int(i)})
-    # Most recent date; ties resolved by last occurrence in source order
-    latest={}
-    for x in out:
-        k=norm(x["product"])
-        if k not in latest or (x["txn_date"],x["row_order"]) >= (latest[k]["txn_date"],latest[k]["row_order"]):
-            latest[k]=x
-    return list(latest.values()), len(out)
 
 def log_upload(kind, filename, count, note=""):
     db("INSERT INTO upload_history(kind,filename,uploaded_at,row_count,note) VALUES(:k,:f,:d,:r,:n)",
@@ -174,16 +259,19 @@ def rates():
     if request.method=="POST":
         kind=request.form.get("kind")
         try:
-            f=request.files.get("file"); df=read_excel(f)
+            f=request.files.get("file")
+            raw=read_raw_excel(f)
             if kind=="sm":
-                rows,total=extract_rates(df,"Particulars1","SM Sale")
+                rows,total=extract_sm_rates(raw)
                 table="sm_rates"; label="SM Sale"
             elif kind=="danish":
-                rows,total=extract_rates(df,"Particulars","Danish Purchase")
+                rows,total=extract_danish_rates(raw)
                 table="danish_rates"; label="Danish Purchase"
             else: raise ValueError("Unknown rate type.")
-            if not rows: raise ValueError("No valid dated product-rate rows found. Existing rates were not changed.")
-            replace_rates(table,rows); log_upload(label,f.filename,len(rows),f"{total} valid rows; latest dated rate retained per product.")
+            if not rows:
+                raise ValueError("No valid dated product rows with quantity and amount were found. Existing rates were not changed.")
+            replace_rates(table,rows)
+            log_upload(label,f.filename,len(rows),f"{total} valid product rows; latest date and last same-date occurrence retained.")
             flash(f"{label} rates replaced successfully: {len(rows)} products saved.","success")
         except Exception as e: flash(str(e),"error")
         return redirect(url_for("rates"))
@@ -236,25 +324,45 @@ def sales():
             sm=rate_dict("sm_rates"); dan=rate_dict("danish_rates")
             out=[]; suggestions=[]
             for x in items:
-                source=x["Particulars"]; key=norm(source)
-                mapped=maps.get(key)
-                exact=stock_by_norm.get(key)
-                if not mapped and exact: mapped=exact
-                if not mapped:
-                    # Auto-map only unambiguous strong matches; otherwise suggest for review.
-                    ranked=sorted(((SequenceMatcher(None,key,norm(s)).ratio(),s) for s in stock_by_norm.values()),reverse=True)
-                    if ranked and ranked[0][0]>=0.96 and (len(ranked)==1 or ranked[0][0]-ranked[1][0]>=0.03):
-                        mapped=ranked[0][1]
-                        db("""INSERT INTO mappings(sales_name,mapped_name,confirmed,updated_at)
-                            VALUES(:s,:m,1,:d) ON CONFLICT(sales_name) DO UPDATE SET mapped_name=:m,updated_at=:d""",
-                           {"s":source,"m":mapped,"d":datetime.utcnow().isoformat(timespec="seconds")})
-                    elif ranked and ranked[0][0]>=0.72:
-                        suggestions.append({"sales":source,"suggested":ranked[0][1],"score":round(ranked[0][0]*100)})
-                final=mapped or "NA"
-                out.append({**x,"60%":final,"Final":final,
-                            "SM Rate":sm.get(norm(final)),"Danish Pur Rate":dan.get(norm(final)),
-                            "Mapping Status":"Mapped" if mapped else "Needs Mapping",
-                            "Rate Status":"Missing Rate" if sm.get(norm(final)) is None and dan.get(norm(final)) is None else "OK"})
+                source=x["Particulars"]
+                key=norm(source)
+                saved_mapping=maps.get(key)
+                exact_sale_name=stock_by_norm.get(key)
+                sale_name=exact_sale_name or "NA"
+
+                # Exact stock matches are automatic. Non-exact matches are only
+                # suggestions; they remain NA until the user saves a mapping.
+                if not saved_mapping and not exact_sale_name:
+                    ranked=sorted(
+                        ((SequenceMatcher(None,key,norm(s)).ratio(),s) for s in stock_by_norm.values()),
+                        reverse=True
+                    )
+                    if ranked and ranked[0][0] >= 0.72:
+                        suggestions.append({
+                            "sales": source,
+                            "suggested": ranked[0][1],
+                            "score": round(ranked[0][0]*100)
+                        })
+
+                final_name=saved_mapping or exact_sale_name or "NA"
+                final_key=norm(final_name) if final_name != "NA" else ""
+                # Danish Purchase Rate has priority. SM Sale is the fallback.
+                selected_rate=dan.get(final_key)
+                selected_source="Danish Purchase" if selected_rate is not None else None
+                if selected_rate is None:
+                    selected_rate=sm.get(final_key)
+                    if selected_rate is not None:
+                        selected_source="SM Sale"
+
+                out.append({
+                    "Particulars": source,
+                    "Narration": x.get("Custom 1",""),
+                    "Sale Name": sale_name,
+                    "Pairs": x.get("Pairs",""),
+                    "Final Name": final_name,
+                    "SM rate or danish pur rate": selected_rate,
+                    "Rate Source": selected_source or "Missing Rate"
+                })
             report={"rows":out,"suggestions":suggestions}
             cur=db("INSERT INTO sales_reports(filename,created_at,report_json) VALUES(:f,:d,:j) RETURNING id",
                    {"f":f.filename,"d":datetime.utcnow().isoformat(timespec="seconds"),"j":json.dumps(report,ensure_ascii=False)})
@@ -279,7 +387,8 @@ def download_report(report_id):
     rows=db("SELECT * FROM sales_reports WHERE id=:id",{"id":report_id},True)
     if not rows: return "Report not found",404
     data=json.loads(rows[0]["report_json"])
-    df=pd.DataFrame(data["rows"])
+    export_columns=["Particulars","Narration","Sale Name","Pairs","Final Name","SM rate or danish pur rate"]
+    df=pd.DataFrame(data["rows"]).reindex(columns=export_columns)
     buf=io.BytesIO()
     with pd.ExcelWriter(buf,engine="openpyxl") as writer:
         df.to_excel(writer,index=False,sheet_name="Sales Result")

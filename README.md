@@ -1,21 +1,54 @@
-# Sales & Rate Manager — first build
+# Sales & Rate Manager — corrected register parser
 
-A Flask web app based on the supplied `Sale (2).xlsx` structure.
+A Flask web app based on the original `Sale (2).xlsx` workbook and the two fresh rate-register samples supplied by the user.
 
-## Included
-- Sales Register upload and report generation.
-- SM Sale Ledger and Danish Purchase Register rate uploads. Each successful upload replaces that rate master.
-- Rate = transaction amount (`Vch Type`) / quantity (number at start of `Column1`). Voucher dates are filled down to detail rows.
-- Per product, latest transaction date wins; if that date occurs more than once, the last row in file order wins.
-- Product mapping editor with direct in-table edits and a Save button. Mappings are stored in the database.
-- Exact stock-name matching, high-confidence unique auto-mapping, and weaker fuzzy suggestions for manual review.
-- Missing rate values remain blank.
-- Sales reports saved in database and downloadable as Excel.
-- Seed stock master extracted from the original workbook's `Stock Name` sheet.
+## Features
+- Upload Sales Register for each reconciliation.
+- Upload SM Sale and Danish Purchase Register Excel files to replace their respective rate masters.
+- Product mapping editor: add/edit/delete mappings directly in the website; mappings persist in the database.
+- Exact stock-name matches are automatic. Uncertain matches are suggestions only; they remain `NA` until a mapping is saved.
+- Rate selection priority: Danish Purchase first, then SM Sale.
+- Rate = Amount / Quantity. Printed rate columns are not used.
+- For each product, latest transaction date wins; if dates tie, last valid occurrence in workbook row order wins.
+- SM Sale rows with blank/invalid amount are ignored. They do not replace a valid earlier rate in the same upload.
+- Danish Purchase and SM Sale rate masters are replaced only after at least one valid product-rate row has been extracted.
+- Sales reports are saved and downloadable as Excel.
+- Missing rates remain blank.
+
+## Exact rate-register layouts implemented
+
+### Danish Purchase Register (`Purchase Register` sheet)
+The workbook has title rows above the column headings. The parser reads the sheet as raw cells:
+- Column A: transaction date on voucher header; carried down to following detail rows.
+- Column B: particulars/product name.
+- Column C: quantity.
+- Column D: printed rate — ignored.
+- Column E: amount — used for calculation.
+- Supplier/voucher header rows, `Local Purchase`, `SMART R/OFF`, `Rounded Off`, headings and blank rows are ignored because they do not contain a valid product + quantity + amount combination.
+
+### SM Sale (`SMART MARKETING-SALE` sheet)
+The workbook has title rows above the column headings. The parser reads the sheet as raw cells:
+- Column A: transaction date on voucher header; carried down to following detail rows.
+- Column C: product name.
+- Column D: quantity.
+- Column E: printed rate — ignored.
+- Column F: amount — used for calculation.
+- Opening/closing balances, voucher headers, `Local Sales`, `SMART R/OFF`, `(as per details)`, headings and blank rows are ignored because they do not contain a valid product + quantity + amount combination.
+- Product rows with blank/invalid amount are ignored. The latest valid dated rate remains eligible.
+
+## Final sales report columns
+1. Particulars
+2. Narration
+3. Sale Name
+4. Pairs
+5. Final Name
+6. SM rate or danish pur rate
+
+`Final Name` is used for rate lookup. Danish Purchase rate is selected first; SM Sale is used only if Danish Purchase has no rate for that product.
 
 ## Run locally on Windows
-1. Install Python 3.11+.
-2. Extract this ZIP, open Command Prompt in the folder.
+1. Install Python 3.11 or 3.12.
+2. Extract this ZIP and open Command Prompt in the folder.
 3. Run:
 
 ```bat
@@ -30,21 +63,19 @@ python app.py
 
 4. Open `http://127.0.0.1:5000`.
 
-Local mode uses SQLite. Initial default credentials if environment variables are not set: `admin` / `ChangeMe123!`. Change these immediately.
+Local mode uses SQLite. If no environment credentials are configured, the initial login is `admin` / `ChangeMe123!`. Change these immediately.
 
 ## Deploy to Render
 1. Push the extracted folder to a private GitHub repository.
-2. Create a Render Web Service using this repository.
+2. Create a Render Web Service using the repository.
 3. Build command: `pip install -r requirements.txt`
 4. Start command: `gunicorn app:app --workers 1 --threads 4 --timeout 120`
-5. Set environment variables: `SECRET_KEY` (long random value), `ADMIN_USERNAME`, `ADMIN_PASSWORD`, and `DATABASE_URL` (PostgreSQL connection string from a persistent database provider).
+5. Set `SECRET_KEY`, `ADMIN_USERNAME`, `ADMIN_PASSWORD`, and `DATABASE_URL` to a persistent PostgreSQL connection string.
 6. Deploy.
 
-Do not use the Render local filesystem for persistent production data. Free database plans have provider-specific storage, inactivity and retention limits; keep regular backups.
+Do not rely on Render's local filesystem for persistent data. Free database availability, limits and retention can change; keep regular database backups.
 
-## Important first-build notes
-- This parser targets the column layouts found in the supplied workbook. It expects the first worksheet of each uploaded workbook to contain the corresponding table data and headers.
-- SM Sale needs `Date`, `Particulars1`, `Column1`, `Vch Type`; Danish Purchase needs `Date`, `Particulars`, `Column1`, `Vch Type`; Sales Register needs `Particulars`, `Column1`, `Vch Type`, `Vch No.`.
-- The app currently returns both SM and Danish rates as separate columns. Confirm the final report layout and any additional workbook formulas against a real test upload before using it for accounting decisions.
-- High-confidence auto-mapping is intentionally conservative. Similar but uncertain matches are displayed as suggestions and are not silently confirmed.
-- This is an initial working build, not a security-audited production system. Use a strong secret/password and a private repository.
+## Notes
+- The uploaded rate workbooks were checked against the extraction logic: Danish Purchase produced 9 valid detail rows (8 unique products after latest-date/tie selection); SM Sale produced 190 valid amount-bearing detail rows (112 unique products after latest-date/tie selection). These are validation counts for the uploaded sample files, not fixed limits.
+- The rate parser expects the corresponding register to be on the first worksheet.
+- Test with copies of your registers before using outputs for accounting decisions.

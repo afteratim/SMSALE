@@ -1,1 +1,13 @@
-{% extends "base.html" %}{% block content %}<div class="row"><div><h1>Sales Report</h1><p class="muted">{{report.filename}}</p></div><a class="button" href="/report/{{report.id}}/download">Download Excel</a></div><section class="card"><div class="scroll"><table><tr>{% for k in ['Particulars','Custom 1','60%','Pairs','Final','SM Rate','Danish Pur Rate','Mapping Status','Rate Status'] %}<th>{{k}}</th>{% endfor %}</tr>{% for r in rows %}<tr><td>{{r.Particulars}}</td><td>{{r['Custom 1']}}</td><td>{{r['60%']}}</td><td>{{r.Pairs}}</td><td>{{r.Final}}</td><td>{{r['SM Rate'] if r['SM Rate'] is not none else ''}}</td><td>{{r['Danish Pur Rate'] if r['Danish Pur Rate'] is not none else ''}}</td><td>{{r['Mapping Status']}}</td><td>{{r['Rate Status']}}</td></tr>{% endfor %}</table></div></section>{% if suggestions %}<section class="card"><h2>Mapping suggestions — manual review</h2><table><tr><th>Sales product</th><th>Suggested</th><th>Score</th></tr>{% for s in suggestions %}<tr><td>{{s.sales}}</td><td>{{s.suggested}}</td><td>{{s.score}}%</td></tr>{% endfor %}</table></section>{% endif %}{% endblock %}
+{% extends "base.html" %}{% block content %}
+<div class="row"><div><h1>Sales Report</h1><p class="muted">{{report.filename}}</p></div><a class="button" href="/report/{{report.id}}/download">Download Excel</a></div>
+<section class="card"><div class="scroll"><table>
+<tr><th>Particulars</th><th>Narration</th><th>Sale Name</th><th>Pairs</th><th>Final Name</th><th>SM rate or danish pur rate</th></tr>
+{% for r in rows %}<tr>
+<td>{{r.Particulars}}</td><td>{{r.Narration}}</td><td>{{r['Sale Name']}}</td><td>{{r.Pairs}}</td><td>{{r['Final Name']}}</td>
+<td>{{"%.5f"|format(r['SM rate or danish pur rate']) if r['SM rate or danish pur rate'] is not none else ''}}</td>
+</tr>{% endfor %}
+</table></div></section>
+{% if suggestions %}<section class="card"><h2>Unmapped product suggestions — manual review</h2><p class="muted">Suggestions are not saved automatically. Add confirmed mappings in Product Mapping.</p>
+<table><tr><th>Sales product</th><th>Suggested stock product</th><th>Similarity</th></tr>
+{% for s in suggestions %}<tr><td>{{s.sales}}</td><td>{{s.suggested}}</td><td>{{s.score}}%</td></tr>{% endfor %}</table></section>{% endif %}
+{% endblock %}
