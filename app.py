@@ -493,7 +493,7 @@ def download_report(report_id):
     rows=db("SELECT * FROM sales_reports WHERE id=:id",{"id":report_id},True)
     if not rows: return "Report not found",404
     data=json.loads(rows[0]["report_json"])
-    export_columns=["Particulars","Narration","Sale Name","Pairs","Final Name","SM rate or danish pur rate"]
+    export_columns=["Final Name","Pairs","SM rate or danish pur rate","Narration"]
     buf=io.BytesIO()
     wb=Workbook()
     ws=wb.active
